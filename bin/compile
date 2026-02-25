@@ -1,0 +1,141 @@
+#!/usr/bin/env bash
+# Custom monorepo buildpack that copies APP_BASE to root while preserving
+# Yarn workspace infrastructure (packages/, yarn.lock, .yarnrc.yml, .yarn/).
+#
+# Drop-in replacement for https://github.com/lstoll/heroku-buildpack-monorepo
+# that supports workspace:* protocol dependencies.
+#
+# Required config var:
+#   APP_BASE - the subdirectory containing the app (e.g., "numero_server")
+
+set -eo pipefail
+
+BUILD_DIR=$1
+CACHE_DIR=$2
+ENV_DIR=$3
+
+# Read APP_BASE from env
+if [ -f "$ENV_DIR/APP_BASE" ]; then
+  APP_BASE=$(cat "$ENV_DIR/APP_BASE")
+fi
+
+if [ -z "$APP_BASE" ]; then
+  echo "       ERROR: APP_BASE is not set. Set it to the subdirectory of your app." >&2
+  exit 1
+fi
+
+echo "-----> Monorepo workspace app detected (APP_BASE=$APP_BASE)"
+
+(
+  cd "$BUILD_DIR"
+
+  if [ ! -d "$APP_BASE" ]; then
+    echo "       ERROR: APP_BASE directory '$APP_BASE' does not exist." >&2
+    exit 1
+  fi
+
+  # --- Stage 1: Save workspace infrastructure to a temp location ---
+  WORKSPACE_STAGE="$(mktemp -d)"
+
+  if [ -d "packages" ]; then
+    echo "       Saving packages/ directory..."
+    cp -R "packages" "$WORKSPACE_STAGE/"
+  fi
+
+  if [ -f "yarn.lock" ]; then
+    echo "       Saving yarn.lock..."
+    cp "yarn.lock" "$WORKSPACE_STAGE/"
+  fi
+
+  if [ -f ".yarnrc.yml" ]; then
+    echo "       Saving .yarnrc.yml..."
+    cp ".yarnrc.yml" "$WORKSPACE_STAGE/"
+  fi
+
+  if [ -d ".yarn" ]; then
+    echo "       Saving .yarn/ directory..."
+    cp -R ".yarn" "$WORKSPACE_STAGE/"
+  fi
+
+  # --- Stage 2: Copy APP_BASE to root (same as lstoll/heroku-buildpack-monorepo) ---
+  APP_STAGE="$(mktemp -d)"
+  shopt -s dotglob
+
+  cp -R "${APP_BASE}/." "$APP_STAGE/" 2>/dev/null
+  rm -rf *
+  cp -R "$APP_STAGE/." . 2>/dev/null
+
+  echo "       Copied $APP_BASE to root of app successfully"
+
+  # --- Stage 3: Restore workspace infrastructure ---
+  if [ -d "$WORKSPACE_STAGE/packages" ]; then
+    cp -R "$WORKSPACE_STAGE/packages" .
+    echo "       Restored packages/ directory"
+  fi
+
+  if [ -f "$WORKSPACE_STAGE/yarn.lock" ]; then
+    cp "$WORKSPACE_STAGE/yarn.lock" .
+    echo "       Restored yarn.lock"
+  fi
+
+  if [ -f "$WORKSPACE_STAGE/.yarnrc.yml" ]; then
+    cp "$WORKSPACE_STAGE/.yarnrc.yml" .
+    echo "       Restored .yarnrc.yml"
+  fi
+
+  if [ -d "$WORKSPACE_STAGE/.yarn" ]; then
+    cp -R "$WORKSPACE_STAGE/.yarn" .
+    echo "       Restored .yarn/ directory"
+  fi
+
+  # --- Stage 4: Patch package.json for workspace resolution ---
+  # Add "workspaces" and "packageManager" fields so Yarn 4 can resolve workspace:* deps.
+  # Uses python3 (available on Heroku-24 stack) since node isn't installed yet.
+  if python3 -c "
+import json, sys, os
+
+pkg_path = 'package.json'
+if not os.path.exists(pkg_path):
+    sys.exit(0)
+
+with open(pkg_path) as f:
+    pkg = json.load(f)
+
+changed = False
+
+# Add workspaces field if packages/ directory was restored
+if os.path.isdir('packages') and 'workspaces' not in pkg:
+    pkg['workspaces'] = ['packages/*']
+    changed = True
+
+# Add packageManager so Heroku Node.js buildpack uses Yarn 4 via Corepack
+if 'packageManager' not in pkg:
+    pkg['packageManager'] = 'yarn@4.12.0'
+    changed = True
+
+if changed:
+    with open(pkg_path, 'w') as f:
+        json.dump(pkg, f, indent=2)
+        f.write('\n')
+
+sys.exit(0)
+" 2>/dev/null; then
+    echo "       Patched package.json with workspaces and packageManager"
+  else
+    echo "       WARNING: Could not patch package.json (python3 not available)" >&2
+    echo "       Falling back to sed-based patching..." >&2
+    # Fallback: use sed to inject fields after the opening brace
+    if ! grep -q '"workspaces"' package.json && [ -d "packages" ]; then
+      sed -i 's/^{$/{\n  "workspaces": ["packages\/*"],/' package.json
+    fi
+    if ! grep -q '"packageManager"' package.json; then
+      sed -i 's/^{$/{\n  "packageManager": "yarn@4.12.0",/' package.json
+    fi
+    echo "       Patched package.json via sed"
+  fi
+
+  # Cleanup
+  rm -rf "$APP_STAGE" "$WORKSPACE_STAGE"
+)
+
+echo "-----> Monorepo workspace buildpack complete"
