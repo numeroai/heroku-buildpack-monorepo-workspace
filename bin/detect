@@ -1,9 +1,6 @@
 #!/usr/bin/env bash
 
-# Detect: succeeds if APP_BASE env var is set (same as lstoll/heroku-buildpack-monorepo)
-if [ -n "$APP_BASE" ]; then
-  echo "Monorepo (workspace)"
-  exit 0
-fi
-
-exit 1
+# Always detect successfully — APP_BASE is checked during compile.
+# Config vars are not available as env vars during detect.
+echo "Monorepo (workspace)"
+exit 0
