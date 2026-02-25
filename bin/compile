@@ -136,6 +136,36 @@ sys.exit(0)
     echo "       Patched via sed"
   fi
 
+  # --- Stage 5: Update yarn.lock for reduced workspace set ---
+  # The root yarn.lock references ALL workspaces, but Heroku only has
+  # APP_BASE + packages/*. We must sync the lockfile here so the Node.js
+  # buildpack's --immutable check passes.
+  if [ -f "yarn.lock" ] && [ -f ".yarn/releases/yarn-4.12.0.cjs" ]; then
+    echo "       Syncing yarn.lock for reduced workspace set..."
+
+    # Export config vars that Yarn needs (e.g., NPM_AUTH_TOKEN for @numeroai scope)
+    if [ -d "$ENV_DIR" ]; then
+      for key in NPM_AUTH_TOKEN GITHUB_TOKEN; do
+        if [ -f "$ENV_DIR/$key" ]; then
+          export "$key=$(cat "$ENV_DIR/$key")"
+        fi
+      done
+    fi
+
+    # Download a temporary Node.js to run the vendored Yarn 4
+    NODE_VERSION="22.22.0"
+    NODE_DIR="$(mktemp -d)"
+    curl -sL "https://nodejs.org/dist/v${NODE_VERSION}/node-v${NODE_VERSION}-linux-x64.tar.gz" \
+      | tar xz -C "$NODE_DIR" --strip-components=1
+
+    # Update only the lockfile — no packages are downloaded or linked
+    "$NODE_DIR/bin/node" .yarn/releases/yarn-4.12.0.cjs install --mode=update-lockfile 2>&1 \
+      | sed 's/^/       /'
+
+    rm -rf "$NODE_DIR"
+    echo "       yarn.lock synced successfully"
+  fi
+
   # Cleanup
   rm -rf "$APP_STAGE" "$WORKSPACE_STAGE"
 )
