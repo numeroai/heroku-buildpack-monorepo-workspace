@@ -88,50 +88,52 @@ echo "-----> Monorepo workspace app detected (APP_BASE=$APP_BASE)"
     echo "       Restored .yarn/ directory"
   fi
 
-  # --- Stage 4: Patch package.json for workspace resolution ---
-  # Add "workspaces" and "packageManager" fields so Yarn 4 can resolve workspace:* deps.
+  # --- Stage 4: Patch package.json and .yarnrc.yml for Heroku ---
   # Uses python3 (available on Heroku-24 stack) since node isn't installed yet.
   if python3 -c "
-import json, sys, os
+import json, sys, os, re
 
+# --- Patch package.json ---
 pkg_path = 'package.json'
-if not os.path.exists(pkg_path):
-    sys.exit(0)
+if os.path.exists(pkg_path):
+    with open(pkg_path) as f:
+        pkg = json.load(f)
 
-with open(pkg_path) as f:
-    pkg = json.load(f)
+    # Add workspaces field if packages/ directory was restored
+    if os.path.isdir('packages') and 'workspaces' not in pkg:
+        pkg['workspaces'] = ['packages/*']
 
-changed = False
+    # Add packageManager so Heroku Node.js buildpack uses Yarn 4 via Corepack
+    if 'packageManager' not in pkg:
+        pkg['packageManager'] = 'yarn@4.12.0'
 
-# Add workspaces field if packages/ directory was restored
-if os.path.isdir('packages') and 'workspaces' not in pkg:
-    pkg['workspaces'] = ['packages/*']
-    changed = True
-
-# Add packageManager so Heroku Node.js buildpack uses Yarn 4 via Corepack
-if 'packageManager' not in pkg:
-    pkg['packageManager'] = 'yarn@4.12.0'
-    changed = True
-
-if changed:
     with open(pkg_path, 'w') as f:
         json.dump(pkg, f, indent=2)
         f.write('\n')
 
+# --- Patch .yarnrc.yml ---
+# Remove yarnPath to avoid conflict with packageManager (Corepack handles it).
+yarnrc_path = '.yarnrc.yml'
+if os.path.exists(yarnrc_path):
+    with open(yarnrc_path) as f:
+        content = f.read()
+    content = re.sub(r'^yarnPath:.*\n?', '', content, flags=re.MULTILINE)
+    with open(yarnrc_path, 'w') as f:
+        f.write(content)
+
 sys.exit(0)
 " 2>/dev/null; then
-    echo "       Patched package.json with workspaces and packageManager"
+    echo "       Patched package.json and .yarnrc.yml for Heroku"
   else
-    echo "       WARNING: Could not patch package.json (python3 not available)" >&2
-    echo "       Falling back to sed-based patching..." >&2
-    # Fallback: use sed to inject fields after the opening brace
+    echo "       WARNING: python3 not available, falling back to sed" >&2
     if ! grep -q '"workspaces"' package.json && [ -d "packages" ]; then
       sed -i 's/^{$/{\n  "workspaces": ["packages\/*"],/' package.json
     fi
     if ! grep -q '"packageManager"' package.json; then
       sed -i 's/^{$/{\n  "packageManager": "yarn@4.12.0",/' package.json
     fi
-    echo "       Patched package.json via sed"
+    sed -i '/^yarnPath:/d' .yarnrc.yml 2>/dev/null
+    echo "       Patched via sed"
   fi
 
   # Cleanup
