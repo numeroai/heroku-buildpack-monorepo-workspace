@@ -119,11 +119,17 @@ except Exception:
   echo "       Detected Yarn version: $YARN_VERSION"
 
   # --- Stage 4: Patch package.json and .yarnrc.yml for Heroku ---
+  # Strategy: Keep yarnPath in .yarnrc.yml so Yarn Classic (installed by Heroku)
+  # transparently delegates to the vendored Yarn 4 binary. Remove packageManager
+  # to prevent Heroku from trying to install the exact Yarn version via Corepack/npm,
+  # which fails for versions not published to the npm registry.
+  #
   # Uses python3 (available on Heroku-24 stack) since node isn't installed yet.
   if python3 -c "
 import json, sys, os, re
 
 yarn_version = '$YARN_VERSION'
+yarn_release = '.yarn/releases/yarn-' + yarn_version + '.cjs'
 
 # --- Patch package.json ---
 pkg_path = 'package.json'
@@ -135,21 +141,23 @@ if os.path.exists(pkg_path):
     if os.path.isdir('packages') and 'workspaces' not in pkg:
         pkg['workspaces'] = ['packages/*']
 
-    # Add packageManager so Heroku Node.js buildpack uses Yarn 4 via Corepack
-    if 'packageManager' not in pkg:
-        pkg['packageManager'] = 'yarn@' + yarn_version
+    # Remove packageManager to prevent Heroku from installing Yarn via Corepack.
+    # The vendored Yarn in .yarn/releases/ is used via yarnPath instead.
+    pkg.pop('packageManager', None)
 
     with open(pkg_path, 'w') as f:
         json.dump(pkg, f, indent=2)
         f.write('\n')
 
 # --- Patch .yarnrc.yml ---
-# Remove yarnPath to avoid conflict with packageManager (Corepack handles it).
+# Ensure yarnPath points to the vendored Yarn release so Yarn Classic delegates
+# to it. If yarnPath is missing, add it.
 yarnrc_path = '.yarnrc.yml'
-if os.path.exists(yarnrc_path):
+if os.path.exists(yarnrc_path) and os.path.exists(yarn_release):
     with open(yarnrc_path) as f:
         content = f.read()
-    content = re.sub(r'^yarnPath:.*\n?', '', content, flags=re.MULTILINE)
+    if 'yarnPath:' not in content:
+        content += '\nyarnPath: ' + yarn_release + '\n'
     with open(yarnrc_path, 'w') as f:
         f.write(content)
 
@@ -161,10 +169,12 @@ sys.exit(0)
     if ! grep -q '"workspaces"' package.json && [ -d "packages" ]; then
       sed -i 's/^{$/{\n  "workspaces": ["packages\/*"],/' package.json
     fi
-    if ! grep -q '"packageManager"' package.json; then
-      sed -i "s/^{$/{\n  \"packageManager\": \"yarn@${YARN_VERSION}\",/" package.json
+    # Remove packageManager line from package.json
+    sed -i '/"packageManager"/d' package.json 2>/dev/null
+    # Ensure yarnPath is present in .yarnrc.yml
+    if ! grep -q 'yarnPath:' .yarnrc.yml 2>/dev/null; then
+      echo "yarnPath: .yarn/releases/yarn-${YARN_VERSION}.cjs" >> .yarnrc.yml
     fi
-    sed -i '/^yarnPath:/d' .yarnrc.yml 2>/dev/null
     echo "       Patched via sed"
   fi
 
