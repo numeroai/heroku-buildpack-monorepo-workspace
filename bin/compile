@@ -57,6 +57,11 @@ echo "-----> Monorepo workspace app detected (APP_BASE=$APP_BASE)"
     cp -R ".yarn" "$WORKSPACE_STAGE/"
   fi
 
+  # Save root package.json so we can detect the Yarn version after Stage 2 wipes it
+  if [ -f "package.json" ]; then
+    cp "package.json" "$WORKSPACE_STAGE/root-package.json"
+  fi
+
   # --- Stage 2: Copy APP_BASE to root (same as lstoll/heroku-buildpack-monorepo) ---
   APP_STAGE="$(mktemp -d)"
   shopt -s dotglob
@@ -88,10 +93,37 @@ echo "-----> Monorepo workspace app detected (APP_BASE=$APP_BASE)"
     echo "       Restored .yarn/ directory"
   fi
 
+  # --- Detect Yarn version from the monorepo root package.json (saved in Stage 1) ---
+  # The root packageManager field is the source of truth for the Yarn version.
+  YARN_VERSION=""
+  if [ -f "$WORKSPACE_STAGE/root-package.json" ] 2>/dev/null; then
+    YARN_VERSION=$(python3 -c "
+import json, sys
+try:
+    with open('$WORKSPACE_STAGE/root-package.json') as f:
+        pm = json.load(f).get('packageManager', '')
+    if pm.startswith('yarn@'):
+        print(pm.replace('yarn@', ''))
+except Exception:
+    pass
+" 2>/dev/null)
+  fi
+  if [ -z "$YARN_VERSION" ]; then
+    # Fallback: try to read from the .yarn/releases directory
+    YARN_VERSION=$(ls .yarn/releases/yarn-*.cjs 2>/dev/null | sed 's/.*yarn-\(.*\)\.cjs/\1/' | head -1)
+  fi
+  if [ -z "$YARN_VERSION" ]; then
+    echo "       WARNING: Could not detect Yarn version, defaulting to 4.13.0" >&2
+    YARN_VERSION="4.13.0"
+  fi
+  echo "       Detected Yarn version: $YARN_VERSION"
+
   # --- Stage 4: Patch package.json and .yarnrc.yml for Heroku ---
   # Uses python3 (available on Heroku-24 stack) since node isn't installed yet.
   if python3 -c "
 import json, sys, os, re
+
+yarn_version = '$YARN_VERSION'
 
 # --- Patch package.json ---
 pkg_path = 'package.json'
@@ -105,7 +137,7 @@ if os.path.exists(pkg_path):
 
     # Add packageManager so Heroku Node.js buildpack uses Yarn 4 via Corepack
     if 'packageManager' not in pkg:
-        pkg['packageManager'] = 'yarn@4.12.0'
+        pkg['packageManager'] = 'yarn@' + yarn_version
 
     with open(pkg_path, 'w') as f:
         json.dump(pkg, f, indent=2)
@@ -130,7 +162,7 @@ sys.exit(0)
       sed -i 's/^{$/{\n  "workspaces": ["packages\/*"],/' package.json
     fi
     if ! grep -q '"packageManager"' package.json; then
-      sed -i 's/^{$/{\n  "packageManager": "yarn@4.12.0",/' package.json
+      sed -i "s/^{$/{\n  \"packageManager\": \"yarn@${YARN_VERSION}\",/" package.json
     fi
     sed -i '/^yarnPath:/d' .yarnrc.yml 2>/dev/null
     echo "       Patched via sed"
@@ -140,7 +172,8 @@ sys.exit(0)
   # The root yarn.lock references ALL workspaces, but Heroku only has
   # APP_BASE + packages/*. We must sync the lockfile here so the Node.js
   # buildpack's --immutable check passes.
-  if [ -f "yarn.lock" ] && [ -f ".yarn/releases/yarn-4.12.0.cjs" ]; then
+  YARN_RELEASE=".yarn/releases/yarn-${YARN_VERSION}.cjs"
+  if [ -f "yarn.lock" ] && [ -f "$YARN_RELEASE" ]; then
     echo "       Syncing yarn.lock for reduced workspace set..."
 
     # Export config vars that Yarn needs (e.g., NPM_AUTH_TOKEN for @numeroai scope)
@@ -159,11 +192,15 @@ sys.exit(0)
       | tar xz -C "$NODE_DIR" --strip-components=1
 
     # Update only the lockfile — no packages are downloaded or linked
-    "$NODE_DIR/bin/node" .yarn/releases/yarn-4.12.0.cjs install --mode=update-lockfile 2>&1 \
+    "$NODE_DIR/bin/node" "$YARN_RELEASE" install --mode=update-lockfile 2>&1 \
       | sed 's/^/       /'
 
     rm -rf "$NODE_DIR"
     echo "       yarn.lock synced successfully"
+  else
+    if [ -f "yarn.lock" ]; then
+      echo "       WARNING: Vendored Yarn release not found at $YARN_RELEASE, skipping lockfile sync" >&2
+    fi
   fi
 
   # Cleanup
