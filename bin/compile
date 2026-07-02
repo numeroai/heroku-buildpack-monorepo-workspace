@@ -145,6 +145,21 @@ if os.path.exists(pkg_path):
     # The vendored Yarn in .yarn/releases/ is used via yarnPath instead.
     pkg.pop('packageManager', None)
 
+    # Carry over the resolutions field from the monorepo root package.json so
+    # the lockfile sync (Stage 5) honors the same pins as local dev / CI.
+    # Yarn only applies resolutions from the top-level manifest, which on
+    # Heroku is the APP_BASE package.json — without this, resolution-pinned
+    # transitive deps silently float to their newest in-range versions.
+    root_pkg_path = '$WORKSPACE_STAGE/root-package.json'
+    if os.path.exists(root_pkg_path):
+        with open(root_pkg_path) as f:
+            root_pkg = json.load(f)
+        root_resolutions = root_pkg.get('resolutions', {})
+        if root_resolutions:
+            merged = dict(root_resolutions)
+            merged.update(pkg.get('resolutions', {}))  # app-level pins win on conflict
+            pkg['resolutions'] = merged
+
     with open(pkg_path, 'w') as f:
         json.dump(pkg, f, indent=2)
         f.write('\n')
@@ -166,6 +181,7 @@ sys.exit(0)
     echo "       Patched package.json and .yarnrc.yml for Heroku"
   else
     echo "       WARNING: python3 not available, falling back to sed" >&2
+    echo "       WARNING: root resolutions field NOT carried over (requires python3); resolution-pinned deps may float" >&2
     if ! grep -q '"workspaces"' package.json && [ -d "packages" ]; then
       sed -i 's/^{$/{\n  "workspaces": ["packages\/*"],/' package.json
     fi
